@@ -1,0 +1,116 @@
+name: Scrape agences (Firecrawl)
+
+on:
+  workflow_dispatch:
+    inputs:
+      time_budget_min:
+        description: "Durée max d'un run en minutes (le job GitHub est limité à 360)"
+        default: "330"
+      per_key_concurrency:
+        description: "Requêtes simultanées par clé = navigateurs du plan (Free 2, Hobby 5, Standard 25)"
+        default: "2"
+      rate_per_min:
+        description: "Requêtes/min par clé et par endpoint (Free 10, Hobby 100, Standard 500 ; 0 = off)"
+        default: "10"
+      max_pages_per_site:
+        description: "Pages scrapées max par site (0 = aucune limite)"
+        default: "0"
+      scrape_all:
+        description: "Scraper TOUTES les URLs mappées (sinon : accueil + contact/équipe/mentions légales...)"
+        type: boolean
+        default: false
+      auto_continue:
+        description: "Relancer automatiquement tant qu'il reste des agences"
+        type: boolean
+        default: true
+      reset:
+        description: "Repartir de zéro (ignore l'état sauvegardé)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write # nécessaire pour se relancer soi-même (gh workflow run)
+
+# un seul run à la fois : le relancement attend la fin du run courant
+concurrency:
+  group: firecrawl-agences
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restaurer l'état (reprise)
+        if: ${{ !inputs.reset }}
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: firecrawl-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: firecrawl-state-
+
+      - name: Scraper
+        id: run
+        env:
+          # Secret : une clé par ligne (ou séparées par des virgules)
+          FIRECRAWL_API_KEYS: ${{ secrets.FIRECRAWL_API_KEYS }}
+          TIME_BUDGET_MIN: ${{ inputs.time_budget_min || '330' }}
+          PER_KEY_CONCURRENCY: ${{ inputs.per_key_concurrency || '2' }}
+          RATE_PER_MIN: ${{ inputs.rate_per_min || '10' }}
+          MAX_PAGES_PER_SITE: ${{ inputs.max_pages_per_site || '0' }}
+          SCRAPE_ALL: ${{ inputs.scrape_all && '1' || '0' }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set +e
+          python scrape_agences.py
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Sauvegarder l'état
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: firecrawl-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Publier le xlsx
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agences_firecrawl-${{ github.run_id }}
+          path: output/agences_firecrawl.xlsx
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Relancer pour la suite
+        if: ${{ steps.run.outputs.code == '10' && inputs.auto_continue != false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run scrape.yml --ref "${{ github.ref_name }}" \
+            -f time_budget_min="${{ inputs.time_budget_min || '330' }}" \
+            -f per_key_concurrency="${{ inputs.per_key_concurrency || '2' }}" \
+            -f rate_per_min="${{ inputs.rate_per_min || '10' }}" \
+            -f max_pages_per_site="${{ inputs.max_pages_per_site || '0' }}" \
+            -f scrape_all="${{ inputs.scrape_all || false }}" \
+            -f auto_continue=true \
+            -f reset=false
+
+      - name: Statut final
+        run: |
+          code="${{ steps.run.outputs.code }}"
+          case "$code" in
+            0)  echo "Terminé : toutes les agences sont traitées." ;;
+            10) echo "Il reste des agences : relance automatique (ou relancer à la main)." ;;
+            3)  echo "::error::Toutes les clés Firecrawl sont épuisées. Ajoutez des clés dans le secret FIRECRAWL_API_KEYS puis relancez."; exit 1 ;;
+            *)  echo "::error::Échec (code $code)"; exit 1 ;;
+          esac
